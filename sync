@@ -1,0 +1,107 @@
+#!/usr/local/apache/bin/php
+<?php
+
+/** CONFIGURATION **/
+define(NEXUS_FOLDER, "0B2gEy70FraS_NzRkYzVmMzctZTE4ZC00NDdhLTlhMjEtZTdmMDUwMzVjYWFl");
+define(FILE_DIR, "/share/Multimedia/Nexus");
+define(HASH_DIR, "/share/Multimedia/Nexus/.hashes");
+define(CLIENT_ID, "933712632234-7aobpdpjb1m69vs83adg6e4756j3fque.apps.googleusercontent.com");
+define(CLIENT_SECRET, "zhwjeskpyQWJ1rmygPwtIbP4");
+define(AUTH_TOKEN_FILE, "token.json");
+define(MAX_PROCESS_TIME, "-3 days");
+define(FILE_OWNER, "matthias:everyone");
+
+require_once 'google-api-php-client/src/Google_Client.php';
+require_once 'google-api-php-client/src/contrib/Google_DriveService.php';
+
+function p_log($msg) {
+  print "[".date("Y-m-d H:i.s")." (".getmypid().")]  ".$msg."\n";
+}
+function download($file) {
+  $pid = pcntl_fork();
+  if($pid > 0) {
+    p_log("Triggert download of {$file['hash']} ({$file['title']})");
+    return;
+  } else {
+    $hash_file = HASH_DIR."/".$file['hash'];
+    $sync_file = FILE_DIR."/".$file['title'];
+    p_log("Starting to download {$file['hash']} ({$file['title']})");
+    file_put_contents($hash_file, getmypid().":".time());
+    $request = new Google_HttpRequest($file['url'], 'GET', null, null);
+    $httpRequest = Google_Client::$io->authenticatedRequest($request);
+    if ($httpRequest->getResponseHttpCode() == 200) {
+      $content = $httpRequest->getResponseBody();
+      file_put_contents($sync_file, $content);
+      exec("shown ".FILE_OWNER." {$sync_file}");
+      file_put_contents($hash_file, 'done');
+    } else {
+      p_log("File {$file['hash']} ({$file['title']}) has no content! ".$httpRequest->getResponseHttpCode());
+      unlink($hash_file);
+    }
+    p_log("Finished download of {$file['hash']} ({$file['title']})");
+    die("");
+  }
+}
+
+$client = new Google_Client();
+$client->setClientId(CLIENT_ID);
+$client->setClientSecret(CLIENT_SECRET);
+$client->setRedirectUri('urn:ietf:wg:oauth:2.0:oob');
+$client->setScopes(array('https://www.googleapis.com/auth/drive'));
+
+$accessToken = file_get_contents(AUTH_TOKEN_FILE);
+$client->setAccessToken($accessToken);
+
+$service = new Google_DriveService($client);
+
+$all_files = $service->files->list();
+$files = array();
+foreach($all_files['items'] as $file) {
+  $add = false;
+  foreach($file['parents'] as $parent) {
+    if($parent['id'] == NEXUS_FOLDER) {
+      $add = true;
+      break;
+    }
+  }
+  if($add) {
+    $files[] = array(
+      'title' => $file['originalFilename'],
+      'url'   => $file['downloadUrl'],
+      'hash'  => $file['md5Checksum']
+    );
+  }
+}
+
+p_log("Found ".count($files)." files to check out!");
+
+foreach($files as $file) {
+  $hash_file = HASH_DIR."/".$file['hash'];
+  if(!file_exists($hash_file)) {
+    p_log("Found new file {$file['hash']} ({$file['title']})!");
+    download($file);
+  } else {
+    $content = file_get_contents($hash_file);
+    if(!$content) {
+      p_log("Found invalid hash file {$file['hash']} ({$file['title']})! Reeinitailizing download");
+      unlink($hash_file);
+      download($file);
+    } else if($content != 'done') {
+      $parts = split(":",$content);
+      $pid  = $parts[0];
+      $ts   = $parts[1];
+      if(!file_exists("/proc/{$pid}")) {
+	p_log("Found aborted file download for {$file['hash']} ({$file['title']}): no process {$pid} found");
+        unlink($hash_file);
+        download($file);
+      } else if($ts < strtotime(MAX_PROCESS_TIME)) {
+        p_log("Aborting process {$pid} (running too long [".date("Y-m-d H:i:s", $ts)."])");
+        exec("kill -9 ".$parts[0]);
+        unlink($hash_file);
+        download($file);
+      }
+    }
+  }
+}
+p_log("Finished sync!");
+?>
